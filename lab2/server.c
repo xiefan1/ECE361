@@ -14,6 +14,13 @@
 #define nthreads 4 //number of data threads
 #define maxsessions 20
 #define DEBUG
+#define lenname 10 //MAX_NAME
+#define lenpass 10
+
+//hard-coded userid and password
+char username[1][lenname]={"hamid"};
+char password[1][lenpass]={"hm123"};
+
 
 //linked list to store users in a session
 struct room{
@@ -34,6 +41,7 @@ int s_counter[maxsessions]={0}; //keep tracking #users in a session
 
 /** functions ***/
 void* session_begin(void *);
+void error_timeout(int sockfd);
 
 
 int main(int argc, char** argv){
@@ -46,23 +54,21 @@ int main(int argc, char** argv){
 	memset(sessions, 0, sizeof(struct room)*maxsessions);
 	pthread_t threads[nthreads];
 	//divide parallal workload
-	struct args t_arg;
-	t_arg.list=sessions;
-	t_arg.num_sessions=maxsessions/nthreads;
+	struct args t_arg[4];
 
 	int i, err;
 	for(i=0; i<nthreads; ++i){
 
-		t_arg.pid=i;
-		err=pthread_create(threads+i,NULL,session_begin,(void*)&t_arg);
-		printf("main pid %d, %d\n",i, (int)(t_arg.list-sessions));
+	t_arg[i].num_sessions=maxsessions/nthreads;
+	t_arg[i].list=sessions+i*t_arg[i].num_sessions;
+		t_arg[i].pid=i;
+		err=pthread_create(threads+i,NULL,session_begin,(void*)&t_arg[i]);
 
 		if(err){
 			perror("pthread_create");
 			exit(-1);
 		}
 
-		t_arg.list+=t_arg.num_sessions;
 	}
 
 	struct addrinfo hints,*res, *iter;
@@ -151,12 +157,16 @@ void* session_begin(void * voidData){
 
 
 
-
-
+while(1)
+;
+printf("thread %d return\n",arg->pid);
 	return 0;
 }
 
-void read_request(int sockfd){
+
+//id authetication
+//id and password are maxmimum 10 bytes each
+int authorize_usr(int sockfd){
 	//set timeout to the following recv call.
 	//a round trip time is about 200ms
 	struct timeval timeout;
@@ -165,20 +175,52 @@ void read_request(int sockfd){
 	int err = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
 		&timeout, sizeof(timeout));
 	
-	char buf[100]={0};
-	err = recv(sockfd,(void*)buf,100,0); 
-	if(errno==EAGAIN) return; //times out
+	int done=0, count=0;
+	char buf[100];
 
-	char type[20];
-	int count = sscanf(buf,"%s",type);
-	if(strcmp(type,"LOGIN")==0){
-		//id authetication
-		char id[10],pass[10];
-		sscanf(buf+count, "%s %s",id,pass);
+	while(!done && count<3){
+		memset(buf,0,100);
+		err = recv(sockfd,(void*)buf,100,0); 
 
-
-
+		if(errno==EAGAIN){ //times out
+			error_timeout(sockfd);
+			return done;
+		}
+	
+		char type[20];
+		int numB = sscanf(buf,"%s",type);
+		if(strcmp(type,"LOGIN")==0){
+			char id[lenname],pass[lenpass];
+			sscanf(buf+count, "%s %s",id,pass);
+			//check id with password
+	
+	
+		}else{
+			//wrong id or password
+			++count;
+			char msg[]="LO_NAK:wrong username or password";
+			send(sockfd, msg, strlen(msg),0);
+			continue;	
+		}
 	}
+	if(!done){
+		//authetication fails
+		char msg[]="LO_NAK:wrong username or password";
+		send(sockfd, msg, strlen(msg),0);
+	}
+
+	return done;
+}
+
+void read_request(int sockfd){
 
 
 }
+
+void error_timeout(int sockfd){
+	char buf[8]="TIMEOUT";
+	send(sockfd,(void*)buf,strlen(buf),0);
+	close(sockfd);
+	return;
+}
+
