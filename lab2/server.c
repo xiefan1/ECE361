@@ -9,9 +9,10 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <sys/select.h>
+#include <assert.h>
 
 #define BACKLOG 10 //the size of listening queue
-#define nthreads 1 //number of data threads
 #define maxsessions 20
 #define lenname 10 //MAX_NAME
 #define lenpass 10
@@ -25,16 +26,12 @@
 //linked list to store users in a session
 struct room{
 	int sockfd; //connection b/t the server and client
-	int uid; //user name
+	int uid; //user idex
 	int session_id;
+	struct room* prev;
 	struct room* next;
 };
 
-struct args{
-	struct room *list;
-	int num_sessions;
-	int pid;
-};
 
 struct packet{
 	char type[10];
@@ -46,9 +43,11 @@ struct packet{
 
 /*** global variables ***/
 //array of linked lists
-struct room sessions[maxsessions]={0}; //max available sessions are 50
-int s_counter[maxsessions]={0}; //keep tracking #users in a session
+struct room* sessions[maxsessions]; //max available sessions are 50
+int ss_ref[maxsessions]={0}; //keep tracking #users in a session
 int active_user[numusers]; //keep track active users, index is the key, user-socket is the value
+fd_set readfds; //set of user socket descriptors
+int max_sockfd=-1; //the highest-numbered socket descriptor  
 
 
 /*** data section ***/
@@ -59,13 +58,150 @@ char const password[numusers][lenpass]={"hm123","finding101","christmas","matrix
 
 
 /** functions ***/
-void* session_begin(void *);
+void* session_begin();
 void error_timeout(int sockfd);
 void read_buffer(char buffer[], struct packet*);
 int authorize_user(int sockfd);
+int create_session(int uindex);
+struct room* create_room(int uindex,int sid);
+struct room* delete_room(struct room* _r);
+void leave_all_sessions(int uindex);
+
+//this broad casts to all sessions uid is in
+void broadcast_sessions(char *buf,int uindex, int len){
+	int i=0,count=0;
+
+	//find all sessions this user is in
+	int pending_sessions[maxsessions];
+	for(i=0;i<maxsessions;++i){
+		struct room* cur=sessions[i];
+		while(cur!=NULL){
+			if(cur->uid==uindex){
+				pending_sessions[count]=i;	
+				++count;
+				break;
+			}
+			cur=cur->next;
+		}
+	}
+
+	//send the message
+	for(i=0;i<count;++i){
+		struct room* cur=sessions[i];
+		while(cur!=NULL){
+			if(cur->uid!=uindex) 
+				send(active_user[cur->uid],buf,len,0);;
+			cur=cur->next;
+		}
+	}
+
+}
+
+void reset_max_socket(){
+	max_sockfd=-1;
+
+	int i=0;
+	for(;i<numusers;++i){
+		if(active_user[i]>max_sockfd)
+			max_sockfd=active_user[i];
+	}
+}
+
+
+void leave_all_sessions(int uindex){
+	int i=0;
+	for(;i<maxsessions;++i){
+		struct room* cur=sessions[i];
+		while(cur!=NULL){
+			if(cur->uid==uindex){
+				cur = delete_room(cur);
+				ss_ref[i]--;
+				assert(ss_ref[i]>=0);
+			}
+			else cur=cur->next;
+		}
+	}
+}
+
+//this function allocate a new session to the user and return the session id
+int create_newsession(int uindex){
+	int i=0;
+	for(;i<maxsessions;++i){
+		if(ss_ref[i]!=0) continue;
+
+		ss_ref[i]+=1;
+		sessions[i]=create_room(uindex,i);
+		return i;
+	}
+	return -1;
+}
+
+struct room* create_room(int uindex,int sid){
+	struct room* ret=malloc(sizeof(struct room));
+	//Todo: lock
+	ret->sockfd = active_user[uindex];
+	ret->uid = uindex;
+	ret->session_id = sid;
+	ret->prev=NULL;
+	ret->next=NULL;
+	return ret;
+}
+
+void leave_session(int userid, int ssid){
+	struct room* cur=sessions[ssid];
+	while(cur!=NULL){
+		if(cur->uid==userid){
+			delete_room(cur);
+			ss_ref[ssid]--;
+			assert(ss_ref[ssid]>=0);
+			return;
+		}
+		cur=cur->next;
+	}
+}
+
+
+void join_session(int userid, int ssid){
+	struct room* cur=sessions[ssid];
+	struct room* user = create_room(userid,ssid);
+	cur->prev=user;
+	user->next=cur;;
+	sessions[ssid]=user;
+	ss_ref[ssid]++;
+}
+
+//delete _r and return the next struct room pointed by _r
+struct room* delete_room(struct room* _r){
+	if(!_r) return NULL;
+	if(_r->prev!=NULL)
+		_r->prev->next=_r->next;
+	struct room* ret;
+	ret = _r->next;
+	_r->next=NULL;
+	_r->prev=NULL;
+	free(_r);
+	return ret;
+}
+
+int query_us(char *buf){
+	int i=0,offset=0;
+	for(;i<maxsessions;++i){
+		struct room* cur=sessions[i];
+		while(cur!=NULL){
+			offset=sprintf(buf+offset,"<%s,%d>\n",
+				username[cur->uid],cur->session_id);
+
+			cur=cur->next;
+		}
+	}
+	if(offset>lendata)
+		return -1;
+	else return 0;
+}
 
 //id authetication, return 1 on success, o therwise
 //on success, this function adds the user index and sockfd into active_user
+//and add this sockfd into select set
 int authorize_user(int sockfd){
 	const int maxlen=2000;
 	char buf[maxlen]={0};
@@ -75,8 +211,8 @@ int authorize_user(int sockfd){
 	//set timeout to the following recv call.
 	//a round trip time is about 200ms
 	struct timeval timeout;
-	timeout.tv_sec = 0;
-	timeout.tv_usec = 400000;
+	timeout.tv_sec = 60;
+	timeout.tv_usec = 0;
 	int err = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
 		&timeout, sizeof(timeout));
 
@@ -96,6 +232,7 @@ int authorize_user(int sockfd){
 			if(strcmp(username[i],_packet.uid)==0){
 				if(strcmp(password[i],_packet.data)==0){
 					if(active_user[i]==-1){	
+						//Todo: can add a lock here
 						active_user[i]=sockfd;
 						char msg[]="LO_ACK";
 						send(sockfd,msg,strlen(msg),0);
@@ -160,11 +297,16 @@ int main(int argc, char** argv){
 	}
 
 	/** data initialization**/
-	memset(sessions, 0, sizeof(struct room)*maxsessions);
 	int i,err;
+	for(i=0;i<maxsessions;++i){
+		sessions[i]=NULL;
+		ss_ref[i]=0;
+	}
 	for(i=0;i<numusers;++i){
 		active_user[i]=-1;
 	}
+
+	FD_ZERO(&readfds); //clear all entries from the set
 
 
 	struct addrinfo hints,*res, *iter;
@@ -226,24 +368,13 @@ int main(int argc, char** argv){
 
 
 	/** create worker thread **/
-	pthread_t threads[nthreads];
-	struct args t_arg[nthreads];
-
-	for(i=0; i<nthreads; ++i){
-
-		//divide parallal workload
-		t_arg[i].num_sessions=maxsessions/nthreads;
-		t_arg[i].list=sessions+i*t_arg[i].num_sessions;
-		t_arg[i].pid=i;
-
-		err=pthread_create(threads+i,NULL,session_begin,(void*)&t_arg[i]);
-
-		if(err){
-			perror("pthread_create");
-			exit(-1);
-		}
-
+	pthread_t data_thread;
+	err=pthread_create(&data_thread,NULL,session_begin,NULL);
+	if(err){
+		perror("pthread_create");
+		exit(-1);
 	}
+
 
 
 	//keep receving new connections
@@ -261,6 +392,12 @@ int main(int argc, char** argv){
 		//this function adds user and new_sockfd into active_user
 		if(!authorize_user(new_sockfd))
 			close(new_sockfd);
+		else{
+			//user connected
+			//Todo: need lock here
+			FD_SET(new_sockfd, &readfds);
+			if(new_sockfd>max_sockfd) max_sockfd=new_sockfd;
+		}
 
 	}
 
@@ -268,23 +405,97 @@ int main(int argc, char** argv){
 }
 
 
+//worker thread processess all user commands other than "login"
 void* session_begin(void * voidData){
-	struct args* arg = voidData;
-	struct room *list = arg->list;
-	int size = arg->num_sessions;
+	int i;
 
 	#ifdef DEBUG
-	printf("session begins at %d %d\n",(int)(arg->list-sessions),arg->pid);
-	int i=0;
-	for(;i<numusers;++i){
-	if(active_user[i]!=-1)
-	printf("active user: %s\n", username[i]);
-	}
+	printf("session begins\n");
 	#endif
 
+	while(1){
+		//listen on the user sockfds
+		//timeval is null to wait indefinitely
+		int err=select(max_sockfd+1,&readfds,NULL,NULL,NULL);
+		if(err<0) perror("select");
+	
+		for(i=0;i<numusers;++i){
+			if(active_user[i]==-1) continue;
+			if(FD_ISSET(active_user[i],&readfds)){
+				char temp_buf[lendata*2];
+				struct packet _p;
+				int fd=active_user[i];
+				memset(temp_buf,0,lendata*2);
+
+				recv(fd,temp_buf,lendata*2,0);
+				read_buffer(temp_buf,&_p);
+
+				assert(strcmp(username[i],_p.uid)==0);
+
+				if(strcmp(_p.type,"EXIT")==0){
+					//user log out
+					leave_all_sessions(i);
+					FD_CLR(fd, &readfds);
+					active_user[i]=-1;
+					reset_max_socket();
+					printf("user %s exists\n",username[i]);
+
+				}else if(strcmp(_p.type,"JOIN")==0){
+					int ssid = atoi(_p.data);
+					char reply[100]={0};
+					if(ssid<0 || ssid>= maxsessions)
+						sprintf(reply,"JN_NACK:session %d out of "
+							"bound (0,%d)",ssid,maxsessions-1);
+					else if(ss_ref[ssid]==0)
+						sprintf(reply,"JN_NACK:session %d does not "
+							"exist.",ssid);
+					else{
+						sprintf(reply,"JN_ACK");
+						join_session(i,ssid);
+					}
+					send(fd,reply,strlen(reply),0);
+
+				}else if(strcmp(_p.type,"LEAVE_SESS")==0){
+					int ssid = atoi(_p.data);
+					if(ssid<0 || ssid>= maxsessions) break;
+
+					if(ss_ref[ssid]>0)
+						leave_session(i,ssid);
+
+				}else if(strcmp(_p.type,"NEW_SESS")==0){
+					char reply[50];
+					int ssid=create_newsession(i);	
+					if(ssid<0){
+						sprintf(reply,"NS_NACK:new session fails");
+					}
+					else{
+						sprintf(reply,"NS_ACK:%d",ssid);
+					}
+					send(fd,reply,100,0);
+					
+				}else if(strcmp(_p.type,"MESSAGE")==0){
+					char reply[lendata+8];
+					int len = sprintf(reply,"MESSAGE:");
+					memcpy(reply+len,_p.data,_p.size*sizeof(char));
+					len+=_p.size;
+					broadcast_sessions(reply,i,len);
+				
+				}else if(strcmp(_p.type,"QUERY")==0){
+					char reply[lendata+7];
+					sprintf(reply,"QU_ACK:");
+					int err = query_us(reply+7);
+					if(err<-1)
+						fprintf(stderr,"query buffer overflows\n");
+					else
+						send(fd,reply,lendata+7,0);
+				}
+
+				break;
+			}
+		}
+	}
 
 	return 0;
 }
-
 
 
