@@ -1,3 +1,5 @@
+//Fan Xie
+//2017-03-15
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
@@ -47,7 +49,8 @@ struct room* sessions[maxsessions]; //max available sessions are 50
 int ss_ref[maxsessions]={0}; //keep tracking #users in a session
 int active_user[numusers]; //keep track active users, index is the key, user-socket is the value
 fd_set readfds; //set of user socket descriptors
-int max_sockfd=-1; //the highest-numbered socket descriptor  
+int max_sockfd; //the highest-numbered socket descriptor  
+int master_fd; //new connection socket
 
 
 /*** data section ***/
@@ -58,7 +61,7 @@ char const password[numusers][lenpass]={"hm123","finding101","christmas","matrix
 
 
 /** functions ***/
-void* session_begin();
+void session_begin();
 void error_timeout(int sockfd);
 void read_buffer(char buffer[], struct packet*);
 int authorize_user(int sockfd);
@@ -98,7 +101,7 @@ void broadcast_sessions(char *buf,int uindex, int len){
 }
 
 void reset_max_socket(){
-	max_sockfd=-1;
+	max_sockfd=master_fd;
 
 	int i=0;
 	for(;i<numusers;++i){
@@ -188,7 +191,7 @@ int query_us(char *buf){
 	for(;i<maxsessions;++i){
 		struct room* cur=sessions[i];
 		while(cur!=NULL){
-			offset=sprintf(buf+offset,"<%s,%d>\n",
+			offset+=sprintf(buf+offset,"<%s,%d>\n",
 				username[cur->uid],cur->session_id);
 
 			cur=cur->next;
@@ -204,7 +207,7 @@ int query_us(char *buf){
 //and add this sockfd into select set
 int authorize_user(int sockfd){
 	const int maxlen=2000;
-	char buf[maxlen]={0};
+	char buf[2000]={0};
 	struct packet _packet;
 	memset(&_packet,0,sizeof(_packet));
 
@@ -306,8 +309,6 @@ int main(int argc, char** argv){
 		active_user[i]=-1;
 	}
 
-	FD_ZERO(&readfds); //clear all entries from the set
-
 
 	struct addrinfo hints,*res, *iter;
 	bzero(&hints, sizeof(hints));
@@ -363,40 +364,50 @@ int main(int argc, char** argv){
 		perror("listen");
 		return 1;
 	}
-
+	master_fd = sockfd;
 	printf("server: waiting for connections...\n");
-
-
-	/** create worker thread **/
-	pthread_t data_thread;
-	err=pthread_create(&data_thread,NULL,session_begin,NULL);
-	if(err){
-		perror("pthread_create");
-		exit(-1);
-	}
-
 
 
 	//keep receving new connections
 	while(1){
-		struct sockaddr new_addr;
-		socklen_t new_addrlen;
 
-		int new_sockfd = accept(sockfd,&new_addr, &new_addrlen);
-		if(new_sockfd<0){
-			perror("accept");
-			continue;
+
+		FD_ZERO(&readfds); //clear all entries from the set
+		FD_SET(master_fd,&readfds); //add to the read set
+
+		max_sockfd = master_fd;
+		for(i=0;i<numusers;++i){
+			if(active_user[i]!=-1){
+				FD_SET(active_user[i],&readfds);
+
+				if(active_user[i]>max_sockfd)
+					max_sockfd=active_user[i];
+			}
 		}
 
-		//id authetication
-		//this function adds user and new_sockfd into active_user
-		if(!authorize_user(new_sockfd))
-			close(new_sockfd);
+
+		//timeval is null to wait indefinitely
+		int err=select(max_sockfd+1,&readfds,NULL,NULL,NULL);
+		if(err<0) perror("select");
+
+		if(FD_ISSET(master_fd,&readfds)){
+			struct sockaddr new_addr;
+			socklen_t new_addrlen;
+
+			int new_sockfd = accept(sockfd,&new_addr, &new_addrlen);
+			if(new_sockfd<0){
+				perror("accept");
+				continue;
+			}
+
+			//id authetication
+			//this function adds user and new_sockfd into active_user
+			if(!authorize_user(new_sockfd))
+				close(new_sockfd);
+		}
 		else{
-			//user connected
-			//Todo: need lock here
-			FD_SET(new_sockfd, &readfds);
-			if(new_sockfd>max_sockfd) max_sockfd=new_sockfd;
+			//new data coming in
+			session_begin();
 		}
 
 	}
@@ -406,96 +417,98 @@ int main(int argc, char** argv){
 
 
 //worker thread processess all user commands other than "login"
-void* session_begin(void * voidData){
+void session_begin(){
 	int i;
 
 	#ifdef DEBUG
 	printf("session begins\n");
 	#endif
+	for(i=0;i<numusers;++i){
+		if(active_user[i]==-1) continue;
+		if(FD_ISSET(active_user[i],&readfds)){
+			char temp_buf[lendata*2];
+			struct packet _p;
+			int fd=active_user[i];
+			memset(temp_buf,0,lendata*2);
+			memset(&_p,0,sizeof(struct packet));
 
-	while(1){
-		//listen on the user sockfds
-		//timeval is null to wait indefinitely
-		int err=select(max_sockfd+1,&readfds,NULL,NULL,NULL);
-		if(err<0) perror("select");
-	
-		for(i=0;i<numusers;++i){
-			if(active_user[i]==-1) continue;
-			if(FD_ISSET(active_user[i],&readfds)){
-				char temp_buf[lendata*2];
-				struct packet _p;
-				int fd=active_user[i];
-				memset(temp_buf,0,lendata*2);
+			recv(fd,temp_buf,lendata*2,0);
+			read_buffer(temp_buf,&_p);
 
-				recv(fd,temp_buf,lendata*2,0);
-				read_buffer(temp_buf,&_p);
-
-				assert(strcmp(username[i],_p.uid)==0);
-
-				if(strcmp(_p.type,"EXIT")==0){
-					//user log out
-					leave_all_sessions(i);
-					FD_CLR(fd, &readfds);
-					active_user[i]=-1;
-					reset_max_socket();
-					printf("user %s exists\n",username[i]);
-
-				}else if(strcmp(_p.type,"JOIN")==0){
-					int ssid = atoi(_p.data);
-					char reply[100]={0};
-					if(ssid<0 || ssid>= maxsessions)
-						sprintf(reply,"JN_NACK:session %d out of "
-							"bound (0,%d)",ssid,maxsessions-1);
-					else if(ss_ref[ssid]==0)
-						sprintf(reply,"JN_NACK:session %d does not "
-							"exist.",ssid);
-					else{
-						sprintf(reply,"JN_ACK");
-						join_session(i,ssid);
-					}
-					send(fd,reply,strlen(reply),0);
-
-				}else if(strcmp(_p.type,"LEAVE_SESS")==0){
-					int ssid = atoi(_p.data);
-					if(ssid<0 || ssid>= maxsessions) break;
-
-					if(ss_ref[ssid]>0)
-						leave_session(i,ssid);
-
-				}else if(strcmp(_p.type,"NEW_SESS")==0){
-					char reply[50];
-					int ssid=create_newsession(i);	
-					if(ssid<0){
-						sprintf(reply,"NS_NACK:new session fails");
-					}
-					else{
-						sprintf(reply,"NS_ACK:%d",ssid);
-					}
-					send(fd,reply,100,0);
-					
-				}else if(strcmp(_p.type,"MESSAGE")==0){
-					char reply[lendata+8];
-					int len = sprintf(reply,"MESSAGE:");
-					memcpy(reply+len,_p.data,_p.size*sizeof(char));
-					len+=_p.size;
-					broadcast_sessions(reply,i,len);
-				
-				}else if(strcmp(_p.type,"QUERY")==0){
-					char reply[lendata+7];
-					sprintf(reply,"QU_ACK:");
-					int err = query_us(reply+7);
-					if(err<-1)
-						fprintf(stderr,"query buffer overflows\n");
-					else
-						send(fd,reply,lendata+7,0);
-				}
-
+			if(strcmp(username[i],_p.uid)!=0){
+				printf("user %s is lost. Closing the socket\n",username[i]);
+				//user log out
+				leave_all_sessions(i);
+				FD_CLR(fd, &readfds);
+				close(active_user[i]);
+				active_user[i]=-1;
+				reset_max_socket();
 				break;
 			}
+
+			if(strcmp(_p.type,"EXIT")==0){
+				//user log out
+				leave_all_sessions(i);
+				FD_CLR(fd, &readfds);
+				//close the socket
+				close(active_user[i]);
+				active_user[i]=-1;
+				reset_max_socket();
+				printf("user %s exits\n",username[i]);
+
+			}else if(strcmp(_p.type,"JOIN")==0){
+				int ssid = atoi(_p.data);
+				char reply[100]={0};
+				if(ssid<0 || ssid>= maxsessions)
+					sprintf(reply,"JN_NACK:session %d out of "
+						"bound (0,%d)",ssid,maxsessions-1);
+				else if(ss_ref[ssid]==0)
+					sprintf(reply,"JN_NACK:session %d does not "
+						"exist.",ssid);
+				else{
+					sprintf(reply,"JN_ACK");
+					join_session(i,ssid);
+				}
+				send(fd,reply,strlen(reply),0);
+
+			}else if(strcmp(_p.type,"LEAVE_SESS")==0){
+				int ssid = atoi(_p.data);
+				if(ssid<0 || ssid>= maxsessions) break;
+
+				if(ss_ref[ssid]>0)
+					leave_session(i,ssid);
+
+			}else if(strcmp(_p.type,"NEW_SESS")==0){
+				char reply[50];
+				int ssid=create_newsession(i);	
+				if(ssid<0){
+					sprintf(reply,"NS_NACK:new session fails");
+				}
+				else{
+					sprintf(reply,"NS_ACK:%d",ssid);
+				}
+				send(fd,reply,100,0);
+				
+			}else if(strcmp(_p.type,"MESSAGE")==0){
+				char reply[lendata+8];
+				int len = sprintf(reply,"MESSAGE:%s-> ",_p.uid);
+				memcpy(reply+len,_p.data,_p.size*sizeof(char));
+				len+=_p.size;
+				broadcast_sessions(reply,i,len);
+			
+			}else if(strcmp(_p.type,"QUERY")==0){
+				char reply[lendata+7];
+				sprintf(reply,"QU_ACK:");
+				int err = query_us(reply+7);
+				if(err<-1)
+					fprintf(stderr,"query buffer overflows\n");
+				else
+					send(fd,reply,lendata+7,0);
+			}
+
+			break;
 		}
 	}
-
-	return 0;
 }
 
 
