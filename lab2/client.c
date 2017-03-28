@@ -1,7 +1,9 @@
-//Author: Fan Xie
-//Author: Karen Cerullo
-//2017-03-15
-// TEXT CONFERENCING LAB - CLIENT - PART 1 (LAB 4)
+//TEXT CONFERENCING LAB 4
+/*	Authors:
+	Karen Cerullo
+	Fan Xie
+	2017-03-15
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +43,18 @@ void error(const char *msg) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+//read the first integer before any ':'
+//return offset in bytes, not including ':'
+int readssid(char* buf,int * ssid){
+	char num[4]={0};
+	int i=0;
+	while(buf[i]!=':'){
+		++i;
+	}
+	memcpy(num,buf,i);
+	*ssid = atoi(num);
+	return i;
+}
 
 int main(int argc, char** argv) {
     
@@ -77,7 +91,7 @@ int main(int argc, char** argv) {
     fd_set readfds; // Set of file discriptors (things that will interrupt)
     //int max_sockfd; // highest-numbered descriptor (sock)
     
-    printf("CLIENT\n");
+    printf("Running client.\n");
            
     // CLIENT LOOP
     
@@ -96,22 +110,54 @@ int main(int argc, char** argv) {
         
         // IF SOCK (RECV) - PRINT MESSAGE
         if(loggedIn && FD_ISSET(sock,&readfds)){
-             // print message
-	     char buf[1024]={0};
-	     
-	     recv(sock,buf,1024,0);
-	     printf("%s\n",buf+8);
+		char buf[1024]={0};
+		recv(sock,buf,1024,0);
+		char header[8]={0};
+		memcpy(header,buf,7);
+		if(strcmp(header,"INVITEE")==0){
+			int ssid =-1;
+			int off = readssid(buf+7,&ssid);
+			printf("%s\n",buf+7+off+1);
+			//printf("\n--- ssid =  %d, bytes = %d\n",ssid,off);
+
+			//get user response
+			int done=0;
+			char response[100]={0};
+			while(!done){
+				done=1;
+				char ans[4]={0};
+				printf("Me-> ");
+				scanf("%3s",ans);
+				if(strcmp(ans,"yes")==0){
+					int len = sprintf(response,"INV_REPLY:%d:%s:yes %d",off+4,clientID,ssid);
+					send(sock,response,len,0);
+
+			                char ackString[100]={0};
+					recv(sock, ackString, 100, 0);
+					printf("%s\n",ackString+10);
+
+				}else if(strcmp(ans,"no")==0){
+					sprintf(response,"INV_REPLY:no %d",ssid);
+				}else{
+					done=0;
+					printf("Please enter yes/no\n");
+					//flush stdin
+					while(getchar()!='\n');
+				}
+			}
+
+		}else //simply print the message
+			printf("%s\n",buf+8);
+		continue;
         }
+
         else if (FD_ISSET(fileno(stdin),&readfds)){
-    
         // IF STDIN - DO COMMANDS        
+
         // Get Command
         scanf("%s",command);
     
-        // Handle Command
-        
-        ////////////////////////////////////////////////////////////////////////
-        
+        // Handle Command        
         if (strcmp(command, "/login") == 0) {
             
             if (loggedIn) {
@@ -190,10 +236,13 @@ int main(int argc, char** argv) {
             }
             
         }
+	else if(!loggedIn){
+                printf("   Not Logged In Yet\n");
+		continue;
+	}
     
-        ////////////////////////////////////////////////////////////////////////
-        
-        else if (strcmp(command, "/logout") == 0) {
+        //other commands other than login
+        if (strcmp(command, "/logout") == 0) {
             
             if (loggedIn) {
                 
@@ -356,37 +405,6 @@ int main(int argc, char** argv) {
               
 		 printf("%s\n",ackString+7);
                 
-/*
-                int ackIndex;
-                int fieldIndex = 0;
-                char field[MAX_SIZE];
-                int userVSsess = 0; // user = 0; session = 1;
-                for (ackIndex=0; ackIndex< strlen(ackString); ackIndex++) {
-                    // If not at a colon
-                    if (ackString[ackIndex] != ':') {
-                        field[fieldIndex] = ackString[ackIndex];
-                        fieldIndex = fieldIndex + 1;
-                    }
-                    // If at a colon
-                    else if (ackString[ackIndex] == ':') {
-                        // Display user
-                        if (userVSsess == 0) {
-                            printf("\n   User: %s -> ", field);       
-                            userVSsess = 1;                           
-                        }
-                        // Display session
-                        else {
-                            printf("Session: ~%s~", field);
-                            userVSsess = 0;
-                        } 
-                        bzero(field,MAX_SIZE);
-                        fieldIndex = 0;
-                    }
-                }
-                
-                // Last session
-                printf("Session: ~%s~\n\n", field);
-         */                       
             }
             
             else {
@@ -405,10 +423,31 @@ int main(int argc, char** argv) {
             sock=-1;
         
             return (EXIT_SUCCESS);
+
         }
-        
-        ////////////////////////////////////////////////////////////////////////
-    
+	else if(strcmp(command,"/switch")==0){
+		int ssid=-1;
+		scanf("%d",&ssid);
+		char msg[100]={0};
+		int len = sprintf(msg,"SWITCH:%d:%s:%d",sizeof(int),clientID,ssid);
+		send(sock,msg,len,0);
+
+                char ackString[100]={0};
+                recv(sock, ackString, 100, 0);
+		if(ackString[3]=='A'){
+			//success
+			printf("%s\n",ackString+7);
+		}else
+			printf("%s\n",ackString+8);
+ 
+	}
+	else if(strcmp(command,"/invite")==0){
+		char invitee[100]={0};
+		scanf("%s",invitee);
+		char msg[100]={0};
+		int len = sprintf(msg,"INVITE:%lu:%s:%s",strlen(invitee),clientID,invitee);
+		send(sock,msg,len,0);
+	}
         else {
             
             // Message
@@ -431,13 +470,10 @@ int main(int argc, char** argv) {
         }
         
         ////////////////////////////////////////////////////////////////////////
-        
+
       } // END OF STDIN 
     
     }
-       
-    ////////////////////////////////////////////////////////////////////////////
-    
     return (EXIT_SUCCESS);
 }
 

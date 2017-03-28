@@ -1,12 +1,16 @@
 CC=gcc
 CFLAGS=-g -c
 LIBS=-lm -lpthread
-SRCS=server.c
+SRCS=server.c client.c
 OBJS=$(SRCS:.c=.o)
 
-all:$(OBJS)
+all:server client
+
+server:server.o
 	$(CC) -o server server.o $(LIBS)
-	#$(CC) -o client client.o
+
+client:client.o
+	$(CC) -o client client.o
 
 $(OBJS):$(SRCS)
 	$(CC) $(CFLAGS) $(SRCS)
@@ -14,4 +18,4 @@ $(OBJS):$(SRCS)
 
 
 clean:
-	rm -f *.o server
+	rm -f *.o server client
