@@ -1,14 +1,14 @@
 # ECE361
 ftp
 -------
-  >a simple (binary) file transfer tool, on tcp
+   a simple (binary) file transfer tool, on tcp
 
 chatApp
 --------
-  >a simple chat app
+   a simple chat app
   
-  >features: multisession, invitation
+   features: multisession, invitation
   
-  >commands that are not in the handout protocol:
-    /switch [sessionID]
-    /invite [username]
+   commands that are not in the handout protocol:
+   - /switch [sessionID]
+   - /invite [username]
